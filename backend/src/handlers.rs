@@ -14,7 +14,7 @@ pub async fn health_check() -> Result<HttpResponse> {
 
 #[get("/list")]
 pub async fn list_templates() -> Result<HttpResponse> {
-    let templates_dir = "static/memes";
+    let templates_dir = "../assets/memes";
     let mut templates = Vec::new();
 
     if let Ok(entries) = fs::read_dir(templates_dir) {
@@ -41,7 +41,7 @@ pub async fn list_templates() -> Result<HttpResponse> {
 
 #[get("/generate")]
 pub async fn generate_random_meme() -> HttpResponse {
-    let templates_dir = "static/memes";
+    let templates_dir = "../assets/memes";
     let mut template_files = Vec::new();
 
     if let Ok(entries) = fs::read_dir(templates_dir) {
@@ -63,13 +63,13 @@ pub async fn generate_random_meme() -> HttpResponse {
     if template_files.is_empty() {
         return HttpResponse::InternalServerError().json(ErrorResponse {
             error: "No memes found".to_string(),
-            details: "No image memes found in static/memes directory".to_string(),
+            details: "No image memes found in memes directory".to_string(),
         });
     }
 
     let mut rng = rand::rng();
     let random_template = &template_files[rng.random_range(0..template_files.len())];
-    let full_path = format!("static/memes/{}", random_template);
+    let full_path = format!("../assets/memes/{}", random_template);
 
     match fs::read(&full_path) {
         Ok(image_data) => {
