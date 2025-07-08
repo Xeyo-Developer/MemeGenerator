@@ -2,6 +2,7 @@ mod handlers;
 
 use actix_web::{App, HttpServer, middleware::Logger, web};
 use handlers::{generate_random_meme, health_check, list_templates};
+use actix_cors::Cors;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -14,26 +15,22 @@ async fn main() -> std::io::Result<()> {
     println!("  - GET  /health - server status check");
     println!("  - GET  /list - list of available memes");
     println!("  - GET  /generate - generate random meme");
-    println!("  ");
 
     HttpServer::new(move || {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allowed_methods(vec!["GET", "POST"])
+            .allowed_headers(vec![
+                actix_web::http::header::CONTENT_TYPE,
+                actix_web::http::header::AUTHORIZATION,
+                actix_web::http::header::ACCEPT,
+            ])
+            .supports_credentials()
+            .max_age(3600);
+
         App::new()
-            .app_data(
-                web::JsonConfig::default()
-                    .limit(10 * 1024 * 1024)
-                    .error_handler(|err, _req| {
-                        let err_msg = format!("JSON parsing failed: {}", err);
-                        println!("❌ JSON Error: {}", err_msg);
-                        actix_web::error::InternalError::from_response(
-                            err,
-                            actix_web::HttpResponse::BadRequest().json(serde_json::json!({
-                                "error": "Invalid JSON",
-                                "details": err_msg
-                            })),
-                        )
-                        .into()
-                    }),
-            )
+            .wrap(cors)
+            .app_data(web::JsonConfig::default().limit(10 * 1024 * 1024))
             .app_data(web::PayloadConfig::default().limit(10 * 1024 * 1024))
             .wrap(Logger::default())
             .service(health_check)
