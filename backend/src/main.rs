@@ -1,8 +1,8 @@
 mod handlers;
 
+use actix_cors::Cors;
 use actix_web::{App, HttpServer, middleware::Logger, web};
 use handlers::{generate_random_meme, health_check, list_templates};
-use actix_cors::Cors;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
