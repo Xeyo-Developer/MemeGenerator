@@ -1,52 +1,128 @@
-use actix_web::{HttpRequest, HttpResponse, Result, get, post, web};
+use actix_web::{HttpResponse, Result, error, get, http::StatusCode, post, web};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum MemeError {
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Meme not found")]
+    NotFound,
+    #[error("Invalid request: {0}")]
+    BadRequest(String),
+    #[error("Internal server error")]
+    InternalServerError,
+}
+
+impl error::ResponseError for MemeError {
+    fn error_response(&self) -> HttpResponse {
+        match self {
+            MemeError::Io(_) | MemeError::Json(_) | MemeError::InternalServerError => {
+                HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: "Internal Server Error".to_string(),
+                    details: self.to_string(),
+                })
+            }
+            MemeError::NotFound => HttpResponse::NotFound().json(ErrorResponse {
+                error: "Not Found".to_string(),
+                details: self.to_string(),
+            }),
+            MemeError::BadRequest(details) => HttpResponse::BadRequest().json(ErrorResponse {
+                error: "Bad Request".to_string(),
+                details: details.to_string(),
+            }),
+        }
+    }
+
+    fn status_code(&self) -> StatusCode {
+        match self {
+            MemeError::Io(_) | MemeError::Json(_) | MemeError::InternalServerError => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            MemeError::NotFound => StatusCode::NOT_FOUND,
+            MemeError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        }
+    }
+}
+
+const MAX_MEME_COUNT: u32 = 50;
+const MEMES_DIR: &str = "../assets/memes";
+const FAVORITES_FILE: &str = "../assets/favorites.json";
+const ALLOWED_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "gif"];
+
+fn validate_meme_path(filename: &str) -> Result<PathBuf, MemeError> {
+    let path = Path::new(MEMES_DIR).join(filename);
+
+    if !path.starts_with(MEMES_DIR) {
+        return Err(MemeError::BadRequest("Invalid file path".to_string()));
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .ok_or_else(|| MemeError::BadRequest("File has no extension".to_string()))?;
+
+    if !ALLOWED_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(MemeError::BadRequest(format!(
+            "Invalid file extension: {}",
+            ext
+        )));
+    }
+
+    Ok(path)
+}
 
 #[get("/health")]
 pub async fn health_check() -> Result<HttpResponse> {
     Ok(HttpResponse::Ok().json(HealthResponse {
         status: "OK".to_string(),
         message: "Meme server is running properly".to_string(),
+        timestamp: Utc::now().to_rfc3339(),
     }))
 }
 
 #[get("/list")]
-pub async fn list_templates() -> Result<HttpResponse> {
-    let templates_dir = "../assets/memes";
+pub async fn list_templates() -> Result<HttpResponse, MemeError> {
     let mut templates = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(templates_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Some(extension) = path.extension() {
-                    let ext = extension.to_string_lossy().to_lowercase();
-                    if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif") {
-                        if let Some(filename) = path.file_name() {
-                            let metadata = fs::metadata(&path).ok();
-                            let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                            let modified = metadata.and_then(|m| m.modified().ok()).and_then(|t| {
-                                DateTime::from_timestamp(
-                                    t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64,
-                                    0,
-                                )
-                            });
+    let entries = fs::read_dir(MEMES_DIR)?;
 
-                            templates.push(MemeTemplate {
-                                name: filename.to_string_lossy().to_string(),
-                                path: path.to_string_lossy().to_string(),
-                                size_bytes: size,
-                                file_type: ext.clone(),
-                                last_modified: modified.map(|dt| dt.to_rfc3339()),
-                            });
-                        }
-                    }
-                }
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ALLOWED_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
+                let metadata = fs::metadata(&path)?;
+                let size = metadata.len();
+                let modified = metadata.modified().ok().and_then(|t| {
+                    DateTime::from_timestamp(
+                        t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64,
+                        0,
+                    )
+                });
+
+                templates.push(MemeTemplate {
+                    name: path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                        .ok_or(MemeError::InternalServerError)?,
+                    path: path.to_string_lossy().to_string(),
+                    size_bytes: size,
+                    file_type: ext.to_lowercase(),
+                    last_modified: modified.map(|dt| dt.to_rfc3339()),
+                });
             }
         }
     }
@@ -61,141 +137,114 @@ pub async fn list_templates() -> Result<HttpResponse> {
 }
 
 #[get("/generate")]
-pub async fn generate_random_meme() -> HttpResponse {
-    let templates_dir = "../assets/memes";
+pub async fn generate_random_meme() -> Result<HttpResponse, MemeError> {
     let mut template_files = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(templates_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Some(extension) = path.extension() {
-                    let ext = extension.to_string_lossy().to_lowercase();
-                    if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif") {
-                        if let Some(filename) = path.file_name() {
-                            template_files.push(filename.to_string_lossy().to_string());
-                        }
-                    }
+    let entries = fs::read_dir(MEMES_DIR)?;
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ALLOWED_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
+                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                    template_files.push(filename.to_string());
                 }
             }
         }
     }
 
     if template_files.is_empty() {
-        return HttpResponse::InternalServerError().json(ErrorResponse {
-            error: "No memes found".to_string(),
-            details: "No image memes found in memes directory".to_string(),
-        });
+        return Err(MemeError::NotFound);
     }
 
     let mut rng = rand::rng();
     let random_template = &template_files[rng.random_range(0..template_files.len())];
-    let full_path = format!("../assets/memes/{}", random_template);
+    let path = validate_meme_path(random_template)?;
 
-    match fs::read(&full_path) {
-        Ok(image_data) => {
-            let content_type = match full_path.split('.').last() {
-                Some("jpg") | Some("jpeg") => "image/jpeg",
-                Some("png") => "image/png",
-                Some("gif") => "image/gif",
-                _ => "image/png",
-            };
+    let image_data = fs::read(&path)?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
 
-            let base64_image = general_purpose::STANDARD.encode(&image_data);
-            let data_url = format!("data:{};base64,{}", content_type, base64_image);
+    let content_type = match ext.to_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        _ => "image/png",
+    };
 
-            HttpResponse::Ok().json(RandomMemeResponse {
-                template_name: random_template.to_string(),
-                image_url: data_url,
-                content_type: content_type.to_string(),
-                size_bytes: image_data.len(),
-                generated_at: Utc::now().to_rfc3339(),
-            })
-        }
-        Err(e) => {
-            eprintln!("❌ Error loading template: {}: {}", full_path, e);
-            HttpResponse::InternalServerError().json(ErrorResponse {
-                error: "Cannot load template".to_string(),
-                details: format!("Cannot load image from {}: {}", full_path, e),
-            })
-        }
-    }
+    let base64_image = general_purpose::STANDARD.encode(&image_data);
+    let data_url = format!("data:{};base64,{}", content_type, base64_image);
+
+    Ok(HttpResponse::Ok().json(RandomMemeResponse {
+        template_name: random_template.to_string(),
+        image_url: data_url,
+        content_type: content_type.to_string(),
+        size_bytes: image_data.len(),
+        generated_at: Utc::now().to_rfc3339(),
+    }))
 }
 
 #[get("/meme/{filename}")]
-pub async fn get_specific_meme(path: web::Path<String>) -> HttpResponse {
+pub async fn get_specific_meme(path: web::Path<String>) -> Result<HttpResponse, MemeError> {
     let filename = path.into_inner();
-    let full_path = format!("../assets/memes/{}", filename);
+    let path = validate_meme_path(&filename)?;
 
-    if !Path::new(&full_path).exists() {
-        return HttpResponse::NotFound().json(ErrorResponse {
-            error: "Meme not found".to_string(),
-            details: format!("Meme '{}' does not exist", filename),
-        });
+    if !path.exists() {
+        return Err(MemeError::NotFound);
     }
 
-    match fs::read(&full_path) {
-        Ok(image_data) => {
-            let content_type = match full_path.split('.').last() {
-                Some("jpg") | Some("jpeg") => "image/jpeg",
-                Some("png") => "image/png",
-                Some("gif") => "image/gif",
-                _ => "image/png",
-            };
+    let image_data = fs::read(&path)?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
 
-            let base64_image = general_purpose::STANDARD.encode(&image_data);
-            let data_url = format!("data:{};base64,{}", content_type, base64_image);
+    let content_type = match ext.to_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        _ => "image/png",
+    };
 
-            HttpResponse::Ok().json(SpecificMemeResponse {
-                template_name: filename,
-                image_url: data_url,
-                content_type: content_type.to_string(),
-                size_bytes: image_data.len(),
-                requested_at: Utc::now().to_rfc3339(),
-            })
-        }
-        Err(e) => HttpResponse::InternalServerError().json(ErrorResponse {
-            error: "Cannot load meme".to_string(),
-            details: format!("Cannot load image from {}: {}", full_path, e),
-        }),
-    }
+    let base64_image = general_purpose::STANDARD.encode(&image_data);
+    let data_url = format!("data:{};base64,{}", content_type, base64_image);
+
+    Ok(HttpResponse::Ok().json(SpecificMemeResponse {
+        template_name: filename,
+        image_url: data_url,
+        content_type: content_type.to_string(),
+        size_bytes: image_data.len(),
+        requested_at: Utc::now().to_rfc3339(),
+    }))
 }
 
 #[get("/random/{count}")]
-pub async fn generate_multiple_memes(path: web::Path<u32>) -> HttpResponse {
+pub async fn generate_multiple_memes(path: web::Path<u32>) -> Result<HttpResponse, MemeError> {
     let count = path.into_inner();
 
-    if count == 0 || count > 50 {
-        return HttpResponse::BadRequest().json(ErrorResponse {
-            error: "Invalid count".to_string(),
-            details: "Count must be between 1 and 50".to_string(),
-        });
+    if count == 0 || count > MAX_MEME_COUNT {
+        return Err(MemeError::BadRequest(format!(
+            "Count must be between 1 and {}",
+            MAX_MEME_COUNT
+        )));
     }
 
-    let templates_dir = "../assets/memes";
     let mut template_files = Vec::new();
+    let entries = fs::read_dir(MEMES_DIR)?;
 
-    if let Ok(entries) = fs::read_dir(templates_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Some(extension) = path.extension() {
-                    let ext = extension.to_string_lossy().to_lowercase();
-                    if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif") {
-                        if let Some(filename) = path.file_name() {
-                            template_files.push(filename.to_string_lossy().to_string());
-                        }
-                    }
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ALLOWED_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
+                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                    template_files.push(filename.to_string());
                 }
             }
         }
     }
 
     if template_files.is_empty() {
-        return HttpResponse::InternalServerError().json(ErrorResponse {
-            error: "No memes found".to_string(),
-            details: "No image memes found in memes directory".to_string(),
-        });
+        return Err(MemeError::NotFound);
     }
 
     let mut rng = rand::rng();
@@ -203,94 +252,80 @@ pub async fn generate_multiple_memes(path: web::Path<u32>) -> HttpResponse {
 
     for _ in 0..count {
         let random_template = &template_files[rng.random_range(0..template_files.len())];
-        let full_path = format!("../assets/memes/{}", random_template);
+        let path = validate_meme_path(random_template)?;
 
-        match fs::read(&full_path) {
-            Ok(image_data) => {
-                let content_type = match full_path.split('.').last() {
-                    Some("jpg") | Some("jpeg") => "image/jpeg",
-                    Some("png") => "image/png",
-                    Some("gif") => "image/gif",
-                    _ => "image/png",
-                };
+        if let Ok(image_data) = fs::read(&path) {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
 
-                let base64_image = general_purpose::STANDARD.encode(&image_data);
-                let data_url = format!("data:{};base64,{}", content_type, base64_image);
+            let content_type = match ext.to_lowercase().as_str() {
+                "jpg" | "jpeg" => "image/jpeg",
+                "png" => "image/png",
+                "gif" => "image/gif",
+                _ => "image/png",
+            };
 
-                memes.push(RandomMemeResponse {
-                    template_name: random_template.to_string(),
-                    image_url: data_url,
-                    content_type: content_type.to_string(),
-                    size_bytes: image_data.len(),
-                    generated_at: Utc::now().to_rfc3339(),
-                });
-            }
-            Err(e) => {
-                eprintln!("❌ Error loading template: {}: {}", full_path, e);
-            }
+            let base64_image = general_purpose::STANDARD.encode(&image_data);
+            let data_url = format!("data:{};base64,{}", content_type, base64_image);
+
+            memes.push(RandomMemeResponse {
+                template_name: random_template.to_string(),
+                image_url: data_url,
+                content_type: content_type.to_string(),
+                size_bytes: image_data.len(),
+                generated_at: Utc::now().to_rfc3339(),
+            });
         }
     }
 
     let count = memes.len();
-    HttpResponse::Ok().json(MultipleMemeResponse {
+    Ok(HttpResponse::Ok().json(MultipleMemeResponse {
         memes,
         count,
         generated_at: Utc::now().to_rfc3339(),
-    })
+    }))
 }
 
 #[get("/stats")]
-pub async fn get_meme_stats() -> HttpResponse {
-    let templates_dir = "../assets/memes";
+pub async fn get_meme_stats() -> Result<HttpResponse, MemeError> {
     let mut stats = MemeStats::default();
+    let entries = fs::read_dir(MEMES_DIR)?;
 
-    if let Ok(entries) = fs::read_dir(templates_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Some(extension) = path.extension() {
-                    let ext = extension.to_string_lossy().to_lowercase();
-                    if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif") {
-                        stats.total_memes += 1;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
 
-                        if let Ok(metadata) = fs::metadata(&path) {
-                            let size = metadata.len();
-                            stats.total_size_bytes += size;
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ALLOWED_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
+                stats.total_memes += 1;
 
-                            if size > stats.largest_file_size {
-                                stats.largest_file_size = size;
-                                stats.largest_file_name = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                            }
+                let metadata = fs::metadata(&path)?;
+                let size = metadata.len();
+                stats.total_size_bytes += size;
 
-                            if stats.smallest_file_size == 0 || size < stats.smallest_file_size {
-                                stats.smallest_file_size = size;
-                                stats.smallest_file_name = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                            }
-                        }
-
-                        match ext.as_str() {
-                            "jpg" | "jpeg" => stats.file_types.insert(
-                                "jpeg".to_string(),
-                                stats.file_types.get("jpeg").unwrap_or(&0) + 1,
-                            ),
-                            "png" => stats.file_types.insert(
-                                "png".to_string(),
-                                stats.file_types.get("png").unwrap_or(&0) + 1,
-                            ),
-                            "gif" => stats.file_types.insert(
-                                "gif".to_string(),
-                                stats.file_types.get("gif").unwrap_or(&0) + 1,
-                            ),
-                            _ => None,
-                        };
-                    }
+                if size > stats.largest_file_size {
+                    stats.largest_file_size = size;
+                    stats.largest_file_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
                 }
+
+                if stats.smallest_file_size == 0 || size < stats.smallest_file_size {
+                    stats.smallest_file_size = size;
+                    stats.smallest_file_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                }
+
+                match ext.to_lowercase().as_str() {
+                    "jpg" | "jpeg" => *stats.file_types.entry("jpeg".to_string()).or_insert(0) += 1,
+                    "png" => *stats.file_types.entry("png".to_string()).or_insert(0) += 1,
+                    "gif" => *stats.file_types.entry("gif".to_string()).or_insert(0) += 1,
+                    _ => (),
+                };
             }
         }
     }
@@ -299,48 +334,39 @@ pub async fn get_meme_stats() -> HttpResponse {
         stats.average_file_size = stats.total_size_bytes / stats.total_memes as u64;
     }
 
-    HttpResponse::Ok().json(stats)
+    Ok(HttpResponse::Ok().json(stats))
 }
 
 #[get("/search")]
-pub async fn search_memes(query: web::Query<SearchQuery>) -> HttpResponse {
+pub async fn search_memes(query: web::Query<SearchQuery>) -> Result<HttpResponse, MemeError> {
     let search_term = query.q.to_lowercase();
-    let templates_dir = "../assets/memes";
     let mut matching_memes = Vec::new();
+    let entries = fs::read_dir(MEMES_DIR)?;
 
-    if let Ok(entries) = fs::read_dir(templates_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Some(extension) = path.extension() {
-                    let ext = extension.to_string_lossy().to_lowercase();
-                    if matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif") {
-                        if let Some(filename) = path.file_name() {
-                            let filename_str = filename.to_string_lossy().to_string();
-                            if filename_str.to_lowercase().contains(&search_term) {
-                                let metadata = fs::metadata(&path).ok();
-                                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
 
-                                matching_memes.push(MemeTemplate {
-                                    name: filename_str,
-                                    path: path.to_string_lossy().to_string(),
-                                    size_bytes: size,
-                                    file_type: ext.clone(),
-                                    last_modified: metadata
-                                        .and_then(|m| m.modified().ok())
-                                        .and_then(|t| {
-                                            DateTime::from_timestamp(
-                                                t.duration_since(std::time::UNIX_EPOCH)
-                                                    .ok()?
-                                                    .as_secs()
-                                                    as i64,
-                                                0,
-                                            )
-                                        })
-                                        .map(|dt| dt.to_rfc3339()),
-                                });
-                            }
-                        }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ALLOWED_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
+                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                    if filename.to_lowercase().contains(&search_term) {
+                        let metadata = fs::metadata(&path)?;
+                        let size = metadata.len();
+                        let modified = metadata.modified().ok().and_then(|t| {
+                            DateTime::from_timestamp(
+                                t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64,
+                                0,
+                            )
+                        });
+
+                        matching_memes.push(MemeTemplate {
+                            name: filename.to_string(),
+                            path: path.to_string_lossy().to_string(),
+                            size_bytes: size,
+                            file_type: ext.to_lowercase(),
+                            last_modified: modified.map(|dt| dt.to_rfc3339()),
+                        });
                     }
                 }
             }
@@ -348,74 +374,65 @@ pub async fn search_memes(query: web::Query<SearchQuery>) -> HttpResponse {
     }
 
     let count = matching_memes.len();
-    HttpResponse::Ok().json(SearchResponse {
+    Ok(HttpResponse::Ok().json(SearchResponse {
         query: search_term,
         results: matching_memes,
         count,
-    })
+    }))
 }
 
 #[post("/favorite")]
 pub async fn toggle_favorite(
-    _req: HttpRequest,
     favorite_req: web::Json<FavoriteRequest>,
-) -> HttpResponse {
-    let favorites_file = "../assets/favorites.json";
+) -> Result<HttpResponse, MemeError> {
+    validate_meme_path(&favorite_req.meme_name)?;
 
-    let mut favorites: Vec<String> = if Path::new(favorites_file).exists() {
-        match fs::read_to_string(favorites_file) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        }
+    let mut favorites: Vec<String> = if Path::new(FAVORITES_FILE).exists() {
+        serde_json::from_str(&fs::read_to_string(FAVORITES_FILE)?)?
     } else {
         Vec::new()
     };
 
-    let meme_name = &favorite_req.meme_name;
-    let was_favorite = favorites.contains(meme_name);
+    let was_favorite = favorites.contains(&favorite_req.meme_name);
 
     if was_favorite {
-        favorites.retain(|x| x != meme_name);
+        favorites.retain(|x| x != &favorite_req.meme_name);
     } else {
-        favorites.push(meme_name.clone());
+        favorites.push(favorite_req.meme_name.clone());
     }
 
-    if let Ok(json) = serde_json::to_string_pretty(&favorites) {
-        let _ = fs::write(favorites_file, json);
-    }
+    fs::write(FAVORITES_FILE, serde_json::to_string_pretty(&favorites)?)?;
 
-    HttpResponse::Ok().json(FavoriteResponse {
-        meme_name: meme_name.clone(),
+    Ok(HttpResponse::Ok().json(FavoriteResponse {
+        meme_name: favorite_req.meme_name.clone(),
         is_favorite: !was_favorite,
         message: if was_favorite {
             "Removed from favorites".to_string()
         } else {
             "Added to favorites".to_string()
         },
-    })
+    }))
 }
 
 #[get("/favorites")]
-pub async fn get_favorites() -> HttpResponse {
-    let favorites_file = "../assets/favorites.json";
-
-    let favorites: Vec<String> = if Path::new(favorites_file).exists() {
-        match fs::read_to_string(favorites_file) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        }
+pub async fn get_favorites() -> Result<HttpResponse, MemeError> {
+    let favorites: Vec<String> = if Path::new(FAVORITES_FILE).exists() {
+        serde_json::from_str(&fs::read_to_string(FAVORITES_FILE)?)?
     } else {
         Vec::new()
     };
 
-    let count = favorites.len();
-    HttpResponse::Ok().json(FavoritesResponse { favorites, count })
+    Ok(HttpResponse::Ok().json(FavoritesResponse {
+        favorites: favorites.clone(),
+        count: favorites.len(),
+    }))
 }
 
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: String,
     pub message: String,
+    pub timestamp: String,
 }
 
 #[derive(Serialize)]
@@ -424,7 +441,7 @@ pub struct ErrorResponse {
     pub details: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct MemeTemplate {
     pub name: String,
     pub path: String,

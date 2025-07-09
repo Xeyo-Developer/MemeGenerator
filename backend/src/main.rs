@@ -28,7 +28,6 @@ async fn main() -> std::io::Result<()> {
     println!("  - POST /favorite         - toggle meme as favorite");
     println!("  - GET  /favorites        - get all favorite memes");
     println!("  ");
-    println!("🔥 ========================================");
 
     HttpServer::new(move || {
         let cors = Cors::default()
