@@ -51,7 +51,6 @@ pub async fn list_templates() -> Result<HttpResponse> {
         }
     }
 
-    // Sortuj alfabetycznie
     templates.sort_by(|a, b| a.name.cmp(&b.name));
 
     let total_count = templates.len();
@@ -361,8 +360,6 @@ pub async fn toggle_favorite(
     _req: HttpRequest,
     favorite_req: web::Json<FavoriteRequest>,
 ) -> HttpResponse {
-    // W prawdziwej aplikacji używałbyś bazy danych
-    // Tutaj symulujemy zapisywanie w pliku JSON
     let favorites_file = "../assets/favorites.json";
 
     let mut favorites: Vec<String> = if Path::new(favorites_file).exists() {
@@ -383,7 +380,6 @@ pub async fn toggle_favorite(
         favorites.push(meme_name.clone());
     }
 
-    // Zapisz z powrotem do pliku
     if let Ok(json) = serde_json::to_string_pretty(&favorites) {
         let _ = fs::write(favorites_file, json);
     }
@@ -416,7 +412,6 @@ pub async fn get_favorites() -> HttpResponse {
     HttpResponse::Ok().json(FavoritesResponse { favorites, count })
 }
 
-// Struktury danych
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: String,
