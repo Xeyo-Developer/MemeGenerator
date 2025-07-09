@@ -1,6 +1,5 @@
 
 <div align="center">
-    <img src="/frontend/public/favicon.ico" width="256" alt="MemeGenerator Logo"/>
     <h1>MemeGenerator</h1>
 </div>
 
